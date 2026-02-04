@@ -1,0 +1,5 @@
+Using built-in specs.
+COLLECT_GCC=aarch64-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/usr/libexec/gcc-cross/aarch64-linux-gnu/13/lto-wrapper
+/
+

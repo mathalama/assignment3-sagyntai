@@ -16,9 +16,18 @@
 #include <time.h>
 
 #define PORT 9000
-#define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
+#define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
 
 // Thread data structure
 struct thread_data_s {
@@ -77,6 +86,7 @@ void daemonize() {
     }
 }
 
+#if !USE_AESD_CHAR_DEVICE
 void* timer_thread_func(void* arg) {
     while (keep_running) {
         
@@ -94,20 +104,19 @@ void* timer_thread_func(void* arg) {
         time(&rawtime);
         info = localtime(&rawtime);
 
-        // Format: timestamp:time\n
-        // Using RFC 2822 format: %a, %d %b %Y %H:%M:%S %z
         strftime(buffer, sizeof(buffer), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", info);
 
         pthread_mutex_lock(&file_mutex);
-        FILE *fp = fopen(DATA_FILE, "a");
-        if (fp) {
-            fputs(buffer, fp);
-            fclose(fp);
+        int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd != -1) {
+            write(fd, buffer, strlen(buffer));
+            close(fd);
         }
         pthread_mutex_unlock(&file_mutex);
     }
     return NULL;
 }
+#endif
 
 void* client_thread_func(void* thread_param) {
     struct thread_data_s* data = (struct thread_data_s*)thread_param;
@@ -116,10 +125,10 @@ void* client_thread_func(void* thread_param) {
     char* full_packet = NULL;
     size_t packet_len = 0;
 
-    while (1) {
+    while (keep_running) {
         bytes_received = recv(data->client_fd, buffer, BUFFER_SIZE, 0);
         if (bytes_received < 0) {
-            perror("recv");
+            if (keep_running) perror("recv");
             break;
         }
         if (bytes_received == 0) {
@@ -140,24 +149,24 @@ void* client_thread_func(void* thread_param) {
 
         if (memchr(buffer, '\n', bytes_received)) {
             pthread_mutex_lock(&file_mutex);
-            FILE *fp = fopen(DATA_FILE, "a");
-            if (fp) {
-                fwrite(full_packet, 1, packet_len, fp);
-                fclose(fp);
+            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            if (fd != -1) {
+                write(fd, full_packet, packet_len);
+                close(fd);
             } else {
-                syslog(LOG_ERR, "Failed to open file for writing");
+                syslog(LOG_ERR, "Failed to open file for writing: %s", strerror(errno));
             }
             
-            fp = fopen(DATA_FILE, "r");
-            if (fp) {
+            fd = open(DATA_FILE, O_RDONLY);
+            if (fd != -1) {
                 char send_buf[BUFFER_SIZE];
-                size_t read_bytes;
-                while ((read_bytes = fread(send_buf, 1, BUFFER_SIZE, fp)) > 0) {
+                ssize_t read_bytes;
+                while ((read_bytes = read(fd, send_buf, BUFFER_SIZE)) > 0) {
                     send(data->client_fd, send_buf, read_bytes, 0);
                 }
-                fclose(fp);
+                close(fd);
             } else {
-                syslog(LOG_ERR, "Failed to open file for reading");
+                syslog(LOG_ERR, "Failed to open file for reading: %s", strerror(errno));
             }
             pthread_mutex_unlock(&file_mutex);
             
@@ -224,12 +233,13 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     // Start timer thread
     pthread_t timer_thread;
     if (pthread_create(&timer_thread, NULL, timer_thread_func, NULL) != 0) {
         perror("pthread_create timer");
-        // continue without timer or exit? Instructions imply timer is required.
     }
+#endif
 
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -241,7 +251,6 @@ int main(int argc, char *argv[]) {
             if (keep_running) {
                 perror("accept");
             }
-            // If accept failed, we still check for completed threads? Yes.
         } else {
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
@@ -266,15 +275,12 @@ int main(int argc, char *argv[]) {
             SLIST_INSERT_HEAD(&head, new_thread_data, entries);
         }
         
-        // Clean up completed threads
         struct thread_data_s *entry = NULL;
-        
-        // Manual iteration for SLIST removal
         struct thread_data_s **ptr = &SLIST_FIRST(&head);
         while ((entry = *ptr) != NULL) {
             if (entry->thread_complete) {
                 pthread_join(entry->thread_id, NULL);
-                *ptr = SLIST_NEXT(entry, entries); // Remove from list
+                *ptr = SLIST_NEXT(entry, entries);
                 free(entry);
             } else {
                 ptr = &SLIST_NEXT(entry, entries);
@@ -282,22 +288,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Main loop exited (signal caught)
-    
-    // Join timer thread
-    // We rely on keep_running=0 for timer thread to exit loop
+#if !USE_AESD_CHAR_DEVICE
     pthread_join(timer_thread, NULL);
+#endif
 
-    // Join all remaining client threads
     while (!SLIST_EMPTY(&head)) {
         struct thread_data_s *entry = SLIST_FIRST(&head);
         SLIST_REMOVE_HEAD(&head, entries);
-        
-        // In case they are blocked on recv, we already shutdown server_fd, 
-        // but client_fds are still open.
-        // Should we shutdown them? The signal handler only shutdown server_fd.
-        // Instructions: "request exit from each thread and wait for completion"
-        shutdown(entry->client_fd, SHUT_RDWR); // Wake up recv
+        shutdown(entry->client_fd, SHUT_RDWR);
         pthread_join(entry->thread_id, NULL);
         free(entry);
     }
@@ -305,7 +303,9 @@ int main(int argc, char *argv[]) {
     if (server_fd != -1) {
         close(server_fd);
     }
+#if !USE_AESD_CHAR_DEVICE
     remove(DATA_FILE);
+#endif
     closelog();
     return 0;
 }
