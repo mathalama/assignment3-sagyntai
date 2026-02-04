@@ -14,6 +14,8 @@
 #include <pthread.h>
 #include <sys/queue.h>
 #include <time.h>
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define PORT 9000
 #define BACKLOG 10
@@ -89,8 +91,6 @@ void daemonize() {
 #if !USE_AESD_CHAR_DEVICE
 void* timer_thread_func(void* arg) {
     while (keep_running) {
-        
-        // Sleep loop to allow faster exit
         for(int i=0; i<10; i++) {
              if(!keep_running) break;
              sleep(1); 
@@ -149,25 +149,51 @@ void* client_thread_func(void* thread_param) {
 
         if (memchr(buffer, '\n', bytes_received)) {
             pthread_mutex_lock(&file_mutex);
-            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
-            if (fd != -1) {
-                write(fd, full_packet, packet_len);
-                close(fd);
-            } else {
-                syslog(LOG_ERR, "Failed to open file for writing: %s", strerror(errno));
+            
+            bool is_ioctl = false;
+            const char *ioctl_str = "AESDCHAR_IOCSEEKTO:";
+            if (strncmp(full_packet, ioctl_str, strlen(ioctl_str)) == 0) {
+                unsigned int write_cmd, write_cmd_offset;
+                if (sscanf(full_packet + strlen(ioctl_str), "%u,%u", &write_cmd, &write_cmd_offset) == 2) {
+                    is_ioctl = true;
+                    int fd = open(DATA_FILE, O_RDWR);
+                    if (fd != -1) {
+                        struct aesd_seekto seekto;
+                        seekto.write_cmd = write_cmd;
+                        seekto.write_cmd_offset = write_cmd_offset;
+                        if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == 0) {
+                            // After ioctl, read remainder of file and send
+                            char send_buf[BUFFER_SIZE];
+                            ssize_t read_bytes;
+                            while ((read_bytes = read(fd, send_buf, BUFFER_SIZE)) > 0) {
+                                send(data->client_fd, send_buf, read_bytes, 0);
+                            }
+                        } else {
+                            syslog(LOG_ERR, "ioctl failed: %s", strerror(errno));
+                        }
+                        close(fd);
+                    }
+                }
+            }
+
+            if (!is_ioctl) {
+                int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                if (fd != -1) {
+                    write(fd, full_packet, packet_len);
+                    close(fd);
+                }
+                
+                fd = open(DATA_FILE, O_RDONLY);
+                if (fd != -1) {
+                    char send_buf[BUFFER_SIZE];
+                    ssize_t read_bytes;
+                    while ((read_bytes = read(fd, send_buf, BUFFER_SIZE)) > 0) {
+                        send(data->client_fd, send_buf, read_bytes, 0);
+                    }
+                    close(fd);
+                }
             }
             
-            fd = open(DATA_FILE, O_RDONLY);
-            if (fd != -1) {
-                char send_buf[BUFFER_SIZE];
-                ssize_t read_bytes;
-                while ((read_bytes = read(fd, send_buf, BUFFER_SIZE)) > 0) {
-                    send(data->client_fd, send_buf, read_bytes, 0);
-                }
-                close(fd);
-            } else {
-                syslog(LOG_ERR, "Failed to open file for reading: %s", strerror(errno));
-            }
             pthread_mutex_unlock(&file_mutex);
             
             free(full_packet);
@@ -234,7 +260,6 @@ int main(int argc, char *argv[]) {
     }
 
 #if !USE_AESD_CHAR_DEVICE
-    // Start timer thread
     pthread_t timer_thread;
     if (pthread_create(&timer_thread, NULL, timer_thread_func, NULL) != 0) {
         perror("pthread_create timer");

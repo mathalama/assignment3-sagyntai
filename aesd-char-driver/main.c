@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
@@ -97,9 +98,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     if (copy_from_user(new_buffptr + dev->working_entry.size, buf, count)) {
         retval = -EFAULT;
-        // we don't free new_buffptr here as it's now dev->working_entry.buffptr if krealloc succeeded
-        // but wait, dev->working_entry.buffptr wasn't updated yet.
-        dev->working_entry.buffptr = new_buffptr; // update it anyway to keep state
+        dev->working_entry.buffptr = new_buffptr;
         goto out;
     }
 
@@ -107,9 +106,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     dev->working_entry.size += count;
     retval = count;
 
-    // Check for newline
     if (memchr(dev->working_entry.buffptr + dev->working_entry.size - count, '\n', count)) {
-        // If the buffer is full, we need to remember the pointer that will be overwritten to free it
         if (dev->buffer.full) {
             overwritten_ptr = dev->buffer.entry[dev->buffer.in_offs].buffptr;
         }
@@ -120,7 +117,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             kfree(overwritten_ptr);
         }
 
-        // Reset working entry (don't free buffptr, it's now in the circular buffer)
         dev->working_entry.buffptr = NULL;
         dev->working_entry.size = 0;
     }
@@ -130,12 +126,101 @@ out:
     return retval;
 }
 
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t total_size = 0;
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
+        total_size += entry->size;
+    }
+
+    mutex_unlock(&dev->lock);
+
+    return fixed_size_llseek(filp, off, whence, total_size);
+}
+
+static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, unsigned int write_cmd_offset)
+{
+    struct aesd_dev *dev = filp->private_data;
+    long retval = 0;
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+    loff_t new_pos = 0;
+    uint8_t count = 0;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    // Check if write_cmd is valid
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
+        if (entry->buffptr) count++;
+    }
+
+    if (write_cmd >= count) {
+        retval = -EINVAL;
+        goto out;
+    }
+
+    // Check if write_cmd_offset is valid within that entry
+    // We need to find the actual entry by index. SLIST? No, it's a circular buffer.
+    // The entries are from out_offs to in_offs.
+    
+    index = dev->buffer.out_offs;
+    for (uint8_t i = 0; i < write_cmd; i++) {
+        new_pos += dev->buffer.entry[index].size;
+        index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    if (write_cmd_offset >= dev->buffer.entry[index].size) {
+        retval = -EINVAL;
+        goto out;
+    }
+
+    new_pos += write_cmd_offset;
+    filp->f_pos = new_pos;
+
+out:
+    mutex_unlock(&dev->lock);
+    return retval;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    long retval = 0;
+    struct aesd_seekto seekto;
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) return -ENOTTY;
+
+    switch (cmd) {
+        case AESDCHAR_IOCSEEKTO:
+            if (copy_from_user(&seekto, (struct aesd_seekto __user *)arg, sizeof(seekto))) {
+                retval = -EFAULT;
+            } else {
+                retval = aesd_adjust_file_offset(filp, seekto.write_cmd, seekto.write_cmd_offset);
+            }
+            break;
+        default:
+            retval = -ENOTTY;
+    }
+
+    return retval;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
